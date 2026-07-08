@@ -185,7 +185,7 @@ ar p $KERNEL_IMG_DEB data.tar.zst | tar -I zstd -xOf - .$KERNEL_IMAGE > $SIGN_TE
 
 ### Workaround: mainline 7.1.x kernels skip /etc/kernel/postinst.d
 
-Recent mainline kernel packages (observed with 7.1.3) ship a broken postinst: it writes its dpkg trigger file once per hook directory using a truncating redirect inside a loop, so when `/usr/share/kernel/postinst.d` exists (it does on any system with a recent `linux-base`), the trigger for `/etc/kernel/postinst.d` gets overwritten. As a result **none** of the `/etc/kernel/postinst.d` hooks run on kernel installation — no initramfs generation, no `update-grub`, and no signing — leaving the new kernel unsigned and unbootable. Telltale signs:
+Recent mainline kernel packages (observed with 7.1.3) ship a broken postinst: it writes its dpkg trigger file once per hook directory using a truncating redirect inside a loop, so when `/usr/share/kernel/postinst.d` exists (it does on any system with a recent `linux-base`), the trigger for `/etc/kernel/postinst.d` gets overwritten. See [docs/mainline-postinst-trigger-bug.md](docs/mainline-postinst-trigger-bug.md) for the full root-cause analysis and diagnosis checklist. As a result **none** of the `/etc/kernel/postinst.d` hooks run on kernel installation — no initramfs generation, no `update-grub`, and no signing — leaving the new kernel unsigned and unbootable. Telltale signs:
 
 ```bash
 $ sbverify --list /boot/vmlinuz-7.1.3-070103-generic
