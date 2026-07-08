@@ -148,8 +148,8 @@ A reminder, this script works well for signing **all** kernel images being insta
 
 The script [zz-mainline-signing](sbin/zz-mainline-signing) is designed to only sign kernels that are installed using the [mainline](https://github.com/bkw777/mainline) Ubuntu utility or via `dpkg` where the kernel was downloaded and installed from the [Ubuntu Mainline](https://kernel.ubuntu.com/~kernel-ppa/mainline/?C=M;O=D) website. This script performs additional checks that validate the authenticity of the kernel images.
 
-1. Searches for matching deb files downloaded by mainline
-2. Downloads the checksum file from the Ubuntu mainline servers
+1. Downloads the checksum file from the Ubuntu mainline servers and verifies its GPG signature against the Kernel PPA key (when `gpg` is available)
+2. Searches for a matching deb file downloaded by mainline in `/home` or `/root`; if none is found (or the local file fails checksum validation), downloads the deb from the Ubuntu mainline servers instead
 3. Validates the deb file matches the Ubuntu mainline servers using sha256
 4. Extracts the kernel image from the mainline deb to a temporary directory
 5. Compares the image to be signed by the script against the kernel image extracted from the mainline deb file

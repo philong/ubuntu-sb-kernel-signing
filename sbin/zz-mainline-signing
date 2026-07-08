@@ -2,6 +2,7 @@
 
 # requires deb packages: binutils zstd tar curl diffutils openssl sbsigntool
 # sudo apt install binutils zstd tar curl diffutils openssl sbsigntool
+# optional: gnupg (verifies the CHECKSUMS signature when a deb is downloaded)
 # inspired by @maxried https://gist.github.com/maxried/796d1f3101b3a03ca153fa09d3af8a11
 
 set -e
@@ -26,7 +27,7 @@ echo "
 "
 
 SIGN_TEMP="$(mktemp -d)"
-trap 'rm -rf -- "$SIGN_TEMP"' EXIT
+trap 'if [ -d "$SIGN_TEMP/gnupg" ]; then gpgconf --homedir "$SIGN_TEMP/gnupg" --kill all 2>/dev/null || true; fi; rm -rf -- "$SIGN_TEMP"' EXIT
 
 if grep -q 'vmlinuz\-.*\-\([0-9]\{6\}\)\(rc[0-9]*\)\?\-generic' <<< "$KERNEL_IMAGE"; then
     echo "${KERNEL_IMAGE} is a generic kernel image to consider signing"
@@ -44,59 +45,93 @@ if grep -q "signature 1" <<< "$(sbverify --list "$KERNEL_IMAGE" 2>&1)"; then
     exit 0
 fi
 
-echo "Finding matching Ubuntu mainline kernels"
-cd /
-if command -v fdfind &>/dev/null; then
-    KERNEL_IMG_DEB=$(fdfind -u --glob "*image-unsigned-${KERNEL_VERSION}*.deb" /home /root 2> /dev/null)
-else
-    KERNEL_IMG_DEB=$(find /home /root -name "*image-unsigned-${KERNEL_VERSION}*.deb" 2> /dev/null ; exit 0)
-fi
-
-echo "Checking if there is more than one or no matching kernel deb files"
-if (($(echo "$KERNEL_IMG_DEB" | wc -l) < 1)); then
-    echo "
-Error: No matching usigned mainline deb file found in /home or /root paths"  >&2
-    echo "Unable to validate official mainline kernel, move deb file into one of these paths, uninstall from apt and try again
-    "
-    exit 1
-elif (($(echo "$KERNEL_IMG_DEB" | wc -l) > 1)); then
-    echo "
-Error: More than one matching unsigned deb file found in /home or /root paths" >&2
-    echo "First remove one of the following files from the file system:"
-    echo "$KERNEL_IMG_DEB"
-    echo "Then reinstall the kernel using the same method again [mainline, dpkg -i]
-    "
-    exit 1
-else
-    echo "Found matching deb file: $KERNEL_IMG_DEB"
-fi
-
-# berglh: Removing the check for mainline in the path, as we want to trust any mainline kernel installed regardless of system path
-# if grep -q 'mainline' <<< $KERNEL_IMG_DEB; then
-#     echo "${KERNEL_VERSION} is a kernel image version matching a mainline deb"
-# else
-#     echo "${KERNEL_VERSION} is not a kernel installed by mainline" >&2
-#     exit 0
-# fi
-
-echo "Checksum of Linux deb from mainline"
-
-MAINLINE_FOLDER=$(sed -e 's:/[^\/]*\.deb::' <<< "$KERNEL_IMG_DEB")
 KERNEL_MAIN_VERSION=v$(sed -e 's/-.*$//' -e 's/\.0$//' <<< "$KERNEL_VERSION")
 ARCH=$(dpkg --print-architecture)
+KERNEL_RC_VERSION=""
 if grep -q "rc" <<< "$KERNEL_VERSION"; then
   KERNEL_RC_VERSION="$(sed -e 's/.*\(\-\)\([0-9]\{6\}\)\(rc*\)/\1\3/' <<< "$KERNEL_VERSION")"
 fi
-curl -k -Ss "https://kernel.ubuntu.com/mainline/${KERNEL_MAIN_VERSION}${KERNEL_RC_VERSION}/${ARCH}/CHECKSUMS" -o "$SIGN_TEMP/CHECKSUMS"
-echo "Mainline folder: $MAINLINE_FOLDER, Kernel image: $KERNEL_IMAGE, Sign temp: $SIGN_TEMP"
-cd "$MAINLINE_FOLDER"
 
-if sha256sum -c <<< "$(sed '1,/^.*ha256:$/d' "$SIGN_TEMP/CHECKSUMS" | grep "$(sed 's:.*/::' <<< "$KERNEL_IMG_DEB")")"; then
-    echo "Successfully sha256 verified deb package"
-else
-    echo "Could not sha256 verfiy deb package, aborting sign" >&2
-    exit 0
+MAINLINE_URL="https://kernel.ubuntu.com/mainline/${KERNEL_MAIN_VERSION}${KERNEL_RC_VERSION}/${ARCH}"
+CURL_OPTS=(-fSs --connect-timeout 15 --max-time 300)
+# Kernel PPA <kernel-ppa@canonical.com>, signs the mainline CHECKSUMS files
+KERNEL_PPA_KEY="60AA7B6F30434AE68E569963E50C6A0917C622B0"
+
+echo "Downloading CHECKSUMS from Ubuntu mainline PPA..."
+if ! curl "${CURL_OPTS[@]}" "$MAINLINE_URL/CHECKSUMS" -o "$SIGN_TEMP/CHECKSUMS"; then
+    echo "Error: Failed to download CHECKSUMS file from Ubuntu mainline PPA." >&2
+    exit 1
 fi
+
+echo "Verifying CHECKSUMS signature"
+if command -v gpg &>/dev/null \
+   && curl "${CURL_OPTS[@]}" "$MAINLINE_URL/CHECKSUMS.gpg" -o "$SIGN_TEMP/CHECKSUMS.gpg"; then
+    export GNUPGHOME="$SIGN_TEMP/gnupg"
+    mkdir -p -m 700 "$GNUPGHOME"
+    if gpg -q --batch --keyserver hkps://keyserver.ubuntu.com --recv-keys "$KERNEL_PPA_KEY" 2> /dev/null; then
+        if gpg --batch --status-fd 1 --verify "$SIGN_TEMP/CHECKSUMS.gpg" "$SIGN_TEMP/CHECKSUMS" 2> /dev/null | grep -q "VALIDSIG $KERNEL_PPA_KEY"; then
+            echo "CHECKSUMS signature verified against Kernel PPA key"
+        else
+            echo "Error: CHECKSUMS signature verification failed, aborting sign" >&2
+            exit 1
+        fi
+    else
+        echo "Warning: could not fetch Kernel PPA key from keyserver, skipping CHECKSUMS signature verification" >&2
+    fi
+    unset GNUPGHOME
+else
+    echo "Warning: gpg or CHECKSUMS.gpg unavailable, skipping CHECKSUMS signature verification" >&2
+fi
+
+KERNEL_IMG_DEB_NAME=$(sed -n "s/.*\(linux-image-.*${KERNEL_VERSION}.*\.deb\)/\1/p" "$SIGN_TEMP/CHECKSUMS" | grep -v "dbgsym" | head -n 1)
+if [ -z "$KERNEL_IMG_DEB_NAME" ]; then
+    echo "Error: Could not find kernel image deb package in CHECKSUMS file." >&2
+    exit 1
+fi
+
+KERNEL_IMG_DEB_SHA256=$(sed '1,/^.*ha256:$/d' "$SIGN_TEMP/CHECKSUMS" | grep -F -- "$KERNEL_IMG_DEB_NAME" || true)
+if [ -z "$KERNEL_IMG_DEB_SHA256" ]; then
+    echo "Error: Could not find sha256 checksum for $KERNEL_IMG_DEB_NAME in CHECKSUMS file." >&2
+    exit 1
+fi
+
+echo "Finding matching Ubuntu mainline kernels locally"
+KERNEL_IMG_DEB=""
+cd /
+if command -v fdfind &>/dev/null; then
+    KERNEL_IMG_DEB=$(fdfind -u --glob "$KERNEL_IMG_DEB_NAME" /home /root 2> /dev/null | head -n 1)
+else
+    KERNEL_IMG_DEB=$(find /home /root -name "$KERNEL_IMG_DEB_NAME" 2> /dev/null | head -n 1)
+fi
+
+if [ -n "$KERNEL_IMG_DEB" ] && [ -f "$KERNEL_IMG_DEB" ]; then
+    echo "Found matching local deb file: $KERNEL_IMG_DEB"
+    cd "$(dirname "$KERNEL_IMG_DEB")"
+    if sha256sum -c <<< "$KERNEL_IMG_DEB_SHA256"; then
+        echo "Successfully sha256 verified local deb package"
+    else
+        echo "Warning: local deb file failed sha256 verification, falling back to download" >&2
+        KERNEL_IMG_DEB=""
+    fi
+fi
+
+if [ -z "$KERNEL_IMG_DEB" ]; then
+    echo "Downloading $KERNEL_IMG_DEB_NAME from mainline PPA..."
+    KERNEL_IMG_DEB="$SIGN_TEMP/$KERNEL_IMG_DEB_NAME"
+    if ! curl "${CURL_OPTS[@]}" "$MAINLINE_URL/$KERNEL_IMG_DEB_NAME" -o "$KERNEL_IMG_DEB"; then
+        echo "Error: Failed to download deb package from Ubuntu mainline PPA." >&2
+        exit 1
+    fi
+    cd "$SIGN_TEMP"
+    if sha256sum -c <<< "$KERNEL_IMG_DEB_SHA256"; then
+        echo "Successfully sha256 verified downloaded deb package"
+    else
+        echo "Error: downloaded deb package failed sha256 verification, aborting sign" >&2
+        exit 1
+    fi
+fi
+
+echo "Using deb: $KERNEL_IMG_DEB, Kernel image: $KERNEL_IMAGE, Sign temp: $SIGN_TEMP"
 
 echo "Verify image being signed comes from mainline deb package"
 KERNEL_IMG_DEB_CONTENTS="$(ar t "$KERNEL_IMG_DEB")"
