@@ -21,6 +21,7 @@ It contains scripts to:
   - [Creating a MOK for kernel signing](#creating-a-mok-for-kernel-signing)
   - [Automated signing of all installed kernels](#automated-signing-of-all-installed-kernels)
   - [Automated signing of kernels installed with Mainline](#automated-signing-of-kernels-installed-with-mainline)
+  - [Workaround: mainline 7.1.x kernels skip /etc/kernel/postinst.d](#workaround-mainline-71x-kernels-skip-etckernelpostinstd)
   - [Manually signing a kernel](#manually-signing-a-kernel)
 - [References](#references)
 
@@ -180,6 +181,37 @@ MOK_DIRECTORY="/var/lib/shim-signed/mok" # edit this line if you stored your MOK
 echo "Verify image being signed comes from mainline deb package"
 ar p $KERNEL_IMG_DEB data.tar.zst | tar -I zstd -xOf - .$KERNEL_IMAGE > $SIGN_TEMP/$(sed 's:.*/::' <<< $KERNEL_IMAGE)
 # ar p $KERNEL_IMG_DEB data.tar.xz | tar -JxOf - .$KERNEL_IMAGE > $SIGN_TEMP/$(sed 's:.*/::' <<< $KERNEL_IMAGE)
+```
+
+### Workaround: mainline 7.1.x kernels skip /etc/kernel/postinst.d
+
+Recent mainline kernel packages (observed with 7.1.3) ship a broken postinst: it writes its dpkg trigger file once per hook directory using a truncating redirect inside a loop, so when `/usr/share/kernel/postinst.d` exists (it does on any system with a recent `linux-base`), the trigger for `/etc/kernel/postinst.d` gets overwritten. As a result **none** of the `/etc/kernel/postinst.d` hooks run on kernel installation — no initramfs generation, no `update-grub`, and no signing — leaving the new kernel unsigned and unbootable. Telltale signs:
+
+```bash
+$ sbverify --list /boot/vmlinuz-7.1.3-070103-generic
+No signature table present
+$ ls /boot/initrd.img-7.1.3-070103-generic
+ls: cannot access '/boot/initrd.img-7.1.3-070103-generic': No such file or directory
+```
+
+The workaround is a pair of hooks:
+
+- [00-etc-kernel-hooks-stamp](sbin/00-etc-kernel-hooks-stamp) goes into `/etc/kernel/postinst.d` and records that the directory ran for a given kernel version.
+- [zz-run-etc-kernel-hooks](sbin/zz-run-etc-kernel-hooks) goes into `/usr/share/kernel/postinst.d` (which always runs). If the stamp is missing, it knows `/etc/kernel/postinst.d` was skipped and runs it itself; on correctly packaged kernels the stamp is present and it does nothing.
+
+```bash
+sudo cp sbin/00-etc-kernel-hooks-stamp /etc/kernel/postinst.d
+sudo cp sbin/zz-run-etc-kernel-hooks /usr/share/kernel/postinst.d
+sudo chown root:root /etc/kernel/postinst.d/00-etc-kernel-hooks-stamp /usr/share/kernel/postinst.d/zz-run-etc-kernel-hooks
+sudo chmod 755 /etc/kernel/postinst.d/00-etc-kernel-hooks-stamp /usr/share/kernel/postinst.d/zz-run-etc-kernel-hooks
+```
+
+If a kernel was already installed while affected by the bug, run the skipped hooks once by hand to sign it and generate its initramfs and boot entries:
+
+```bash
+sudo run-parts --report --exit-on-error \
+  --arg=7.1.3-070103-generic --arg=/boot/vmlinuz-7.1.3-070103-generic \
+  /etc/kernel/postinst.d
 ```
 
 ### Manually signing a kernel

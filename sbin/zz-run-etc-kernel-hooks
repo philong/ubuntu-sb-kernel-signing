@@ -1,0 +1,58 @@
+#!/bin/sh
+# Workaround for a packaging regression in Ubuntu mainline kernels (observed
+# in 7.1.x, e.g. 7.1.3-070103): the linux-image postinst writes its dpkg
+# trigger file once per hook directory using ">" (truncating) inside a loop:
+#
+#     for d in /etc/kernel/postinst.d /usr/share/kernel/postinst.d; do
+#         ...
+#         cat - >/usr/lib/linux/triggers/$version <<EOF
+#     DEB_MAINT_PARAMS="$*" run-parts ... $d
+#     EOF
+#         dpkg-trigger --no-await linux-update-$version
+#     done
+#
+# When /usr/share/kernel/postinst.d exists (it does on any system with a
+# recent linux-base), the second iteration overwrites the first, so the
+# trigger only runs /usr/share/kernel/postinst.d and /etc/kernel/postinst.d
+# is silently skipped: no initramfs, no update-grub, no signing hooks. The
+# freshly installed kernel is left unbootable.
+#
+# This hook lives in /usr/share/kernel/postinst.d, which always runs. Its
+# companion, 00-etc-kernel-hooks-stamp in /etc/kernel/postinst.d, writes a
+# per-version stamp whenever that directory runs. If the stamp is missing
+# here, /etc/kernel/postinst.d was skipped and we run it ourselves. The stamp
+# is consumed either way, so reinstalling the same version later starts clean.
+#
+# Correct packaging (e.g. 7.0.x mainline, Ubuntu archive kernels) runs both
+# directories in a single run-parts invocation with /etc first: the stamp
+# exists by the time this hook runs and we do nothing.
+#
+# DEB_MAINT_PARAMS is inherited from the trigger environment, so hooks run
+# here see the same value they would have seen in the non-buggy path.
+
+version="$1"
+image="$2"
+[ -n "$version" ] || exit 0
+
+stamp="/run/etc-kernel-postinst-ran/$version"
+
+if [ -e "$stamp" ]; then
+    rm -f "$stamp"
+    exit 0
+fi
+
+[ -d /etc/kernel/postinst.d ] || exit 0
+
+echo "W: /etc/kernel/postinst.d was skipped for ${version} (mainline packaging bug), running it now" >&2
+
+rc=0
+if [ -n "$image" ]; then
+    run-parts --report --exit-on-error --arg="$version" --arg="$image" /etc/kernel/postinst.d || rc=$?
+else
+    run-parts --report --exit-on-error --arg="$version" /etc/kernel/postinst.d || rc=$?
+fi
+
+# The nested run re-creates the stamp via 00-etc-kernel-hooks-stamp; consume
+# it even on failure so a retry of the same version is not skipped.
+rm -f "$stamp"
+exit $rc

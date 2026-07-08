@@ -1,0 +1,14 @@
+#!/bin/sh
+# Companion to zz-run-etc-kernel-hooks (see that script for the full story).
+#
+# Records that /etc/kernel/postinst.d actually ran for this kernel version,
+# so the workaround hook in /usr/share/kernel/postinst.d knows nothing was
+# skipped. The stamp is consumed (deleted) by zz-run-etc-kernel-hooks, making
+# it per-installation rather than per-boot.
+
+version="$1"
+[ -n "$version" ] || exit 0
+
+mkdir -p /run/etc-kernel-postinst-ran
+touch "/run/etc-kernel-postinst-ran/$version"
+exit 0
